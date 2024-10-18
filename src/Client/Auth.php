@@ -16,6 +16,7 @@ class Auth
     const DEFAULT_INCREMENTAL_RETRY_IS_ACTIVE = false;
     const DEFAULT_MAX_RETRIES = 5;
     const DEFAULT_MAX_DELAY_BETWEEN_RETRIES_IN_SECONDS = 60;
+    CONST HTTP_UNAUTHORISED = 401;
 
     protected HandlerStack $handlerStack;
     public Client $client;
@@ -80,17 +81,26 @@ class Auth
     protected function shouldAttemptRetry()
     {
         $maxRetries = config('http_client.max_retries') ?? self::DEFAULT_MAX_RETRIES;
+        $retryResponseCodes = config('http_client.retry_response_codes') ?? '';
+        $retryResponseCodes = !empty($retryResponseCodes) ? explode(',', $retryResponseCodes) : [];
 
         return function (
             $retries,
-            RequestInterface $request,
+            RequestInterface &$request,
             ResponseInterface $response = null,
             \Exception $exception = null
-        ) use ($maxRetries) {
-            $doRetry = $retries < $maxRetries
-                && ($exception instanceof \Exception || ($response && $response->getStatusCode() >= 400));
+        ) use ($maxRetries, $retryResponseCodes) {
+            $statusCode = $response->getStatusCode();
+            $doRetry = $retries < $maxRetries && ($exception instanceof \Exception
+                    || in_array($statusCode, $retryResponseCodes));
 
             if ($doRetry) {
+                if ($retries === 3 && $statusCode === self::HTTP_UNAUTHORISED) {
+                    Cache::forget('servicenow_oauth_token');
+                    $newToken = $this->getToken();
+                    $request = $request->withHeader('Authorization', 'Bearer ' . $newToken);
+                }
+
                 $uri = $request->getUri();
                 Log::warning('Retrying request', [
                     'retry_attempt' => $retries + 1,
