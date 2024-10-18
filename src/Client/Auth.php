@@ -90,23 +90,25 @@ class Auth
             ResponseInterface $response = null,
             \Exception $exception = null
         ) use ($maxRetries, $retryResponseCodes) {
+            static $tokenRefreshed = false;
             $statusCode = $response->getStatusCode();
             $doRetry = $retries < $maxRetries && ($exception instanceof \Exception
                     || in_array($statusCode, $retryResponseCodes));
 
             if ($doRetry) {
-                if ($retries === 3 && $statusCode === self::HTTP_UNAUTHORISED) {
-                    Cache::forget('servicenow_oauth_token');
-                    $newToken = $this->getToken();
-                    $request = $request->withHeader('Authorization', 'Bearer ' . $newToken);
-                }
-
                 $uri = $request->getUri();
                 Log::warning('Retrying request', [
                     'retry_attempt' => $retries + 1,
                     'uri' => $uri->getScheme() . '://' . $uri->getHost() . $uri->getPath() . '?' . $uri->getQuery(),
                     'body' => $request->getBody()->getContents(),
                 ]);
+            }
+
+            if ($tokenRefreshed === false && $retries === ($maxRetries - 1) && $statusCode === self::HTTP_UNAUTHORISED) {
+                $tokenRefreshed = true;
+                Cache::forget('servicenow_oauth_token');
+                $newToken = $this->getToken();
+                $request = $request->withHeader('Authorization', 'Bearer ' . $newToken);
             }
 
             return $doRetry;
