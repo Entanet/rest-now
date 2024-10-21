@@ -16,6 +16,7 @@ class Auth
     const DEFAULT_INCREMENTAL_RETRY_IS_ACTIVE = false;
     const DEFAULT_MAX_RETRIES = 5;
     const DEFAULT_MAX_DELAY_BETWEEN_RETRIES_IN_SECONDS = 60;
+    CONST HTTP_UNAUTHORISED = 401;
 
     protected HandlerStack $handlerStack;
     public Client $client;
@@ -52,19 +53,22 @@ class Auth
     /**
      * @return mixed
      */
-    public function getToken()
+    public function getToken($tokenRefreshed = false)
     {
         // Try and retrieve a valid oauth token
         $cachedToken = Cache::get('servicenow_oauth_token');
+        $options = $this->options;
 
-        // It may have expired, or doesnt exist. Access tokens last for 30 minutes
+        if ($tokenRefreshed) {
+            $options['headers']['X-Token-Refreshed'] = $tokenRefreshed;
+        }
+
         if ($cachedToken == null) {
-            $response = $this->client->post('/oauth_token.do', $this->options);
+            $response = $this->client->post('/oauth_token.do', $options);
             $decodedResponse = json_decode($response->getBody());
             $cachedToken = $decodedResponse->access_token;
             Cache::put('servicenow_oauth_token', $cachedToken, now()->addSeconds($decodedResponse->expires_in));
         }
-
         return $cachedToken;
     }
 
@@ -80,15 +84,27 @@ class Auth
     protected function shouldAttemptRetry()
     {
         $maxRetries = config('http_client.max_retries') ?? self::DEFAULT_MAX_RETRIES;
+        $retryResponseCodes = config('http_client.retry_response_codes') ?? '';
+        $retryResponseCodes = !empty($retryResponseCodes) ? explode(',', $retryResponseCodes) : [];
 
         return function (
             $retries,
-            RequestInterface $request,
+            RequestInterface &$request,
             ResponseInterface $response = null,
             \Exception $exception = null
-        ) use ($maxRetries) {
-            $doRetry = $retries < $maxRetries
-                && ($exception instanceof \Exception || ($response && $response->getStatusCode() >= 400));
+        ) use ($maxRetries, $retryResponseCodes) {
+            $headers = $request->getHeaders();
+            $tokenRefreshed = false;
+            if (array_key_exists('X-Token-Refreshed', $headers)) {
+                $tokenRefreshed = $headers['X-Token-Refreshed'][0];
+            }
+            $statusCode = $response->getStatusCode();
+            $doRetry = $retries < $maxRetries && ($exception instanceof \Exception
+                    || in_array($statusCode, $retryResponseCodes));
+
+            if ($doRetry && $tokenRefreshed && $retries > 0) {
+                $doRetry = false;
+            }
 
             if ($doRetry) {
                 $uri = $request->getUri();
@@ -97,6 +113,15 @@ class Auth
                     'uri' => $uri->getScheme() . '://' . $uri->getHost() . $uri->getPath() . '?' . $uri->getQuery(),
                     'body' => $request->getBody()->getContents(),
                 ]);
+
+
+                if ($retries === ($maxRetries - 1) && $statusCode === self::HTTP_UNAUTHORISED) {
+                    Cache::forget('servicenow_oauth_token');
+                    $tokenRefreshed = true;
+                    $newToken = $this->getToken($tokenRefreshed);
+                    $request = $request->withHeader('Authorization', 'Bearer ' . $newToken)
+                        ->withHeader('X-Token-Refreshed', $tokenRefreshed);
+                }
             }
 
             return $doRetry;
